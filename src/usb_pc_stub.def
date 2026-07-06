@@ -1,0 +1,4 @@
+LIBRARY USB_PC
+EXPORTS
+    DllExportTable @1 DATA
+    InitialDll @2

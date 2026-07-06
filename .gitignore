@@ -1,0 +1,19 @@
+# Build output (compiled binaries are not source; users build their own)
+/build/
+*.dll
+*.obj
+*.lib
+*.exp
+*.cat
+
+# Runtime logs / captures (may contain dictionary content - never commit)
+*.log
+usbpc_stub_log*.txt
+*.pcap
+*.pcapng
+
+# Editor / OS cruft
+.vs/
+*.user
+Thumbs.db
+.DS_Store
