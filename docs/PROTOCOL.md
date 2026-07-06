@@ -8,6 +8,16 @@ DLL interface needed to interoperate PASORAMA with the device over WinUSB. It
 contains **no vendor code, no disassembly, and no dictionary data** — only the
 externally observable protocol facts required for a reimplementation.
 
+> 本資料は、相互運用性のために観察された通信仕様を**独自の記述として整理**したものです。
+> 純正バイナリ、その逆アセンブル結果、辞書データ、暗号化・認証・アクセス制限の回避手順は
+> **含みません**。辞書データの抽出・複製・再配布や、実機なしでの利用を目的とするものでは
+> ありません。
+>
+> This is an independent write-up of observed behavior for interoperability only. It
+> includes no vendor binaries, no disassembly, no dictionary data, and no methods for
+> bypassing encryption, authentication, or access controls, and is not for extracting
+> or redistributing dictionary content.
+
 ---
 
 ## 1. トランスポート / Transport
