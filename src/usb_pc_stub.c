@@ -49,12 +49,12 @@ static int g_lock_ready = 0;
  * pure overhead once the protocol is working. Errors are still always logged.
  * Set env USBPC_VERBOSE=1 to re-enable full tracing for debugging. */
 static int g_verbose = 0;
-/* Block cache is OFF by default. It was found to serve stale/wrong bytes in some
- * cases (observed: the first figure in an encyclopedia entry rendered blank
- * because a cached block was returned for a lookup that should have read fresh;
- * disabling the cache fixed it). Correctness outweighs the read speedup, so the
- * cache is opt-in: set USBPC_CACHE=1 to re-enable it (e.g. for experiments). */
-static int g_cache_enabled = 0;
+/* Block cache ON by default. It is now keyed by file path (immutable identity of
+ * a read-only index file), which is correct by construction - see the cache block
+ * below. The earlier remote_handle-keyed cache could serve another file's block
+ * and broke multi-dictionary search / figures; that class of bug is gone. Escape
+ * hatch: set USBPC_NOCACHE=1 to disable it without a rebuild. */
+static int g_cache_enabled = 1;
 
 static HANDLE g_keepalive_thread = NULL;
 static HANDLE g_keepalive_event = NULL;
@@ -62,19 +62,30 @@ static volatile LONG g_keepalive_stop = 0;
 static volatile LONG g_link_broken = 0;
 
 /* --- index9 block cache -------------------------------------------------
- * Search re-reads the same (file, block) ~50% of the time. We cache the
- * fixed-size blocks keyed by (remote_handle, offset) so repeats need no USB.
- * Correctness (no stale data): dictionaries are read-only during a search, and
- * we invalidate a remote_handle's entries whenever that device handle could
- * change identity - on close, on reopen (a reopened file may be assigned a
- * REUSED remote_handle number pointing at different data), and we drop the whole
- * cache on link teardown/reconnect (remote_handle numbering restarts). All cache
- * access happens under g_lock (same as the vfile table), so no extra locking. */
+ * Search re-reads the same (file, block) ~50% of the time, so caching the
+ * fixed-size blocks avoids a lot of USB traffic.
+ *
+ * Correctness is by construction: the key is (path-hash, offset), NOT
+ * (remote_handle, offset). The index9 files are read-only dictionary indices, so
+ * a given (file path, byte offset) always holds the same bytes for the whole
+ * session - the content is IMMUTABLE. Keying on the file path therefore can never
+ * serve one file's block for another, and needs NO invalidation logic.
+ *
+ * (The earlier version keyed on remote_handle - the number the device returns
+ * from open - and relied on invalidating it on close/reopen. That number is
+ * reused across different files, and a gap in the invalidation let a stale block
+ * be served for a different file: the corrupted index lookup made the app compute
+ * a bogus block address, the read came back empty, and multi-dictionary search
+ * and the first figure in an entry silently failed. Path-keying removes that
+ * whole failure class.)
+ *
+ * Only the read-only index9 path uses this cache; writable user files go through
+ * index4 and are never cached. All access is under g_lock. */
 #define BLOCK_CACHE_ENTRIES 2048
 #define BLOCK_CACHE_BYTES 4096u
 typedef struct BLOCK_CACHE_ENTRY {
     int valid;
-    DWORD remote_handle;
+    unsigned __int64 key;   /* FNV-1a hash of the file path = immutable identity */
     DWORD offset;
     DWORD len;
     DWORD lru;
@@ -83,7 +94,20 @@ typedef struct BLOCK_CACHE_ENTRY {
 static BLOCK_CACHE_ENTRY g_block_cache[BLOCK_CACHE_ENTRIES];
 static DWORD g_cache_tick = 0;
 
-static BLOCK_CACHE_ENTRY *cache_lookup(DWORD remote_handle, DWORD offset)
+/* 64-bit FNV-1a over the UTF-16 path. Collisions across a session's handful of
+ * dictionary files are astronomically unlikely. */
+static unsigned __int64 path_key(const WCHAR *p)
+{
+    unsigned __int64 h = 1469598103934665603ULL;
+    int i;
+    for (i = 0; p[i] != 0 && i < 512; i++) {
+        h ^= (unsigned __int64)(unsigned short)p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static BLOCK_CACHE_ENTRY *cache_lookup(unsigned __int64 key, DWORD offset)
 {
     int i;
     if (!g_cache_enabled) {
@@ -91,7 +115,7 @@ static BLOCK_CACHE_ENTRY *cache_lookup(DWORD remote_handle, DWORD offset)
     }
     for (i = 0; i < BLOCK_CACHE_ENTRIES; i++) {
         if (g_block_cache[i].valid &&
-            g_block_cache[i].remote_handle == remote_handle &&
+            g_block_cache[i].key == key &&
             g_block_cache[i].offset == offset) {
             return &g_block_cache[i];
         }
@@ -99,7 +123,7 @@ static BLOCK_CACHE_ENTRY *cache_lookup(DWORD remote_handle, DWORD offset)
     return NULL;
 }
 
-static void cache_store(DWORD remote_handle, DWORD offset,
+static void cache_store(unsigned __int64 key, DWORD offset,
                         const unsigned char *data, DWORD len)
 {
     int i;
@@ -122,22 +146,11 @@ static void cache_store(DWORD remote_handle, DWORD offset,
         }
     }
     g_block_cache[victim].valid = 1;
-    g_block_cache[victim].remote_handle = remote_handle;
+    g_block_cache[victim].key = key;
     g_block_cache[victim].offset = offset;
     g_block_cache[victim].len = len;
     g_block_cache[victim].lru = ++g_cache_tick;
     CopyMemory(g_block_cache[victim].data, data, len);
-}
-
-static void cache_invalidate_handle(DWORD remote_handle)
-{
-    int i;
-    for (i = 0; i < BLOCK_CACHE_ENTRIES; i++) {
-        if (g_block_cache[i].valid &&
-            g_block_cache[i].remote_handle == remote_handle) {
-            g_block_cache[i].valid = 0;
-        }
-    }
 }
 
 static void cache_clear_all(void)
@@ -748,9 +761,8 @@ static int ab_open_payload(const unsigned char *payload, DWORD payload_len,
         return -1;
     }
     *remote_handle = ack_len;
-    /* A freshly opened file may be assigned a remote_handle number that a
-     * previously-closed file used; drop any stale cache under that number. */
-    cache_invalidate_handle(ack_len);
+    /* No cache invalidation needed: the block cache is keyed by file path, not by
+     * remote_handle, so a reused handle number cannot alias another file's data. */
     if (g_verbose) {
         char line[128];
         _snprintf_s(line, sizeof(line), _TRUNCATE,
@@ -799,7 +811,6 @@ static int reopen_vfile(VFILE *vf)
     if (payload_len == 0u) {
         return -1;
     }
-    cache_invalidate_handle(vf->remote_handle); /* old handle's blocks are now dead */
     if (ab_open_payload(payload, payload_len, &remote_handle) != 0) {
         return -1;
     }
@@ -903,6 +914,7 @@ static int impl_sector_read(DWORD handle, DWORD offset, DWORD nbytes,
     DWORD data_len = 0;
     DWORD ack_len = 0;
     DWORD actual = 0;
+    unsigned __int64 key;
 
     if (dst == NULL || nbytes == 0u) {
         return 0;
@@ -915,10 +927,13 @@ static int impl_sector_read(DWORD handle, DWORD offset, DWORD nbytes,
         append_error_log("index9 unknown handle", handle);
         return -1;
     }
+    /* Cache key = hash of the (immutable, read-only) file path, so a reused
+     * remote_handle can never alias another file's cached blocks. */
+    key = path_key(vf->path);
     /* Cache hit: serve the block with no USB traffic at all (no seek, no read).
      * Requires the cached block to hold at least the requested bytes. */
     {
-        BLOCK_CACHE_ENTRY *e = cache_lookup(vf->remote_handle, offset);
+        BLOCK_CACHE_ENTRY *e = cache_lookup(key, offset);
         if (e != NULL && e->len >= nbytes) {
             CopyMemory(dst, e->data, nbytes);
             e->lru = ++g_cache_tick;
@@ -946,7 +961,7 @@ static int impl_sector_read(DWORD handle, DWORD offset, DWORD nbytes,
     vf->desired_pos = vf->stream_pos;
     /* Cache only full reads (short reads at EOF are not re-serveable safely). */
     if (ack_len == nbytes) {
-        cache_store(vf->remote_handle, offset, dst, ack_len);
+        cache_store(key, offset, dst, ack_len);
     }
     return (int)ack_len;
 }
@@ -1109,7 +1124,6 @@ static int impl_close(DWORD a0)
     if (!vf) {
         return -1;
     }
-    cache_invalidate_handle(vf->remote_handle);
     ZeroMemory(vf, sizeof(*vf));
     return 0;
 }
@@ -1551,9 +1565,9 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
         g_link.dev = INVALID_HANDLE_VALUE;
         GetEnvironmentVariableA("USBPC_VERBOSE", verbose_env, (DWORD)sizeof(verbose_env));
         g_verbose = (verbose_env[0] == '1');
-        /* Cache is off by default (see g_cache_enabled); USBPC_CACHE=1 opts in. */
-        GetEnvironmentVariableA("USBPC_CACHE", cache_env, (DWORD)sizeof(cache_env));
-        g_cache_enabled = (cache_env[0] == '1');
+        /* Cache is on by default (path-keyed = correct); USBPC_NOCACHE=1 disables. */
+        GetEnvironmentVariableA("USBPC_NOCACHE", cache_env, (DWORD)sizeof(cache_env));
+        g_cache_enabled = (cache_env[0] != '1');
     } else if (reason == DLL_PROCESS_DETACH) {
         if (g_lock_ready) {
             close_winusb_device();
