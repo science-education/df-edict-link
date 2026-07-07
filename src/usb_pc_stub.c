@@ -49,6 +49,12 @@ static int g_lock_ready = 0;
  * pure overhead once the protocol is working. Errors are still always logged.
  * Set env USBPC_VERBOSE=1 to re-enable full tracing for debugging. */
 static int g_verbose = 0;
+/* Block cache is OFF by default. It was found to serve stale/wrong bytes in some
+ * cases (observed: the first figure in an encyclopedia entry rendered blank
+ * because a cached block was returned for a lookup that should have read fresh;
+ * disabling the cache fixed it). Correctness outweighs the read speedup, so the
+ * cache is opt-in: set USBPC_CACHE=1 to re-enable it (e.g. for experiments). */
+static int g_cache_enabled = 0;
 
 static HANDLE g_keepalive_thread = NULL;
 static HANDLE g_keepalive_event = NULL;
@@ -80,6 +86,9 @@ static DWORD g_cache_tick = 0;
 static BLOCK_CACHE_ENTRY *cache_lookup(DWORD remote_handle, DWORD offset)
 {
     int i;
+    if (!g_cache_enabled) {
+        return NULL;
+    }
     for (i = 0; i < BLOCK_CACHE_ENTRIES; i++) {
         if (g_block_cache[i].valid &&
             g_block_cache[i].remote_handle == remote_handle &&
@@ -96,6 +105,9 @@ static void cache_store(DWORD remote_handle, DWORD offset,
     int i;
     int victim = 0;
     DWORD best = 0xffffffffu;
+    if (!g_cache_enabled) {
+        return;
+    }
     if (len == 0u || len > BLOCK_CACHE_BYTES) {
         return;
     }
@@ -628,6 +640,20 @@ static void close_winusb_device(void)
 
 static int ensure_ready(void)
 {
+    /* Cold-start robustness: opening the WinUSB device path right after
+     * enumeration (or just after a previous handle was released) can transiently
+     * fail with ERROR_ACCESS_DENIED (gle=5), which made the very first connect -
+     * and therefore the first search after launch - fail. Retry the open a few
+     * times with a short backoff before giving up. */
+    if (!g_link.opened) {
+        int attempt;
+        for (attempt = 0; attempt < 10; attempt++) {
+            if (open_winusb_device() == 0) {
+                break;
+            }
+            Sleep(200);
+        }
+    }
     if (open_winusb_device() != 0) {
         return -1;
     }
@@ -1519,11 +1545,15 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
     (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
         char verbose_env[8] = "";
+        char cache_env[8] = "";
         InitializeCriticalSection(&g_lock);
         g_lock_ready = 1;
         g_link.dev = INVALID_HANDLE_VALUE;
         GetEnvironmentVariableA("USBPC_VERBOSE", verbose_env, (DWORD)sizeof(verbose_env));
         g_verbose = (verbose_env[0] == '1');
+        /* Cache is off by default (see g_cache_enabled); USBPC_CACHE=1 opts in. */
+        GetEnvironmentVariableA("USBPC_CACHE", cache_env, (DWORD)sizeof(cache_env));
+        g_cache_enabled = (cache_env[0] == '1');
     } else if (reason == DLL_PROCESS_DETACH) {
         if (g_lock_ready) {
             close_winusb_device();
