@@ -55,6 +55,13 @@ static int g_verbose = 0;
  * and broke multi-dictionary search / figures; that class of bug is gone. Escape
  * hatch: set USBPC_NOCACHE=1 to disable it without a rebuild. */
 static int g_cache_enabled = 1;
+/* Figure/font fallback: try genuine-style op34 after an op37 index9 read cannot
+ * provide useful bytes for font blocks. GT shows op34's high word uses the DLL
+ * handle returned to PASORAMA, not the op37 remote handle, and that local-handle
+ * form returns the missing S3StdFnt blocks that op37 exposes as zero past EOF.
+ * Enabled by default; USBPC_DISABLE_OP34=1 is the diagnostic escape hatch. */
+static int g_experimental_op34 = 1;
+static unsigned char g_op34_session = 0x79;
 
 static HANDLE g_keepalive_thread = NULL;
 static HANDLE g_keepalive_event = NULL;
@@ -259,6 +266,40 @@ static void append_error_log(const char *where, DWORD err)
     _snprintf_s(line, sizeof(line), _TRUNCATE,
                 "ERROR %s gle=%lu\r\n", where, (unsigned long)err);
     append_text_log(line);
+}
+
+static int parse_hex_byte_env(const char *name, unsigned char *out)
+{
+    char buf[16];
+    char *p;
+    DWORD v = 0;
+    DWORD n = GetEnvironmentVariableA(name, buf, (DWORD)sizeof(buf));
+    if (n == 0u || n >= sizeof(buf)) {
+        return 0;
+    }
+    p = buf;
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+        p += 2;
+    }
+    while (*p != '\0') {
+        char c = *p++;
+        DWORD d;
+        if (c >= '0' && c <= '9') {
+            d = (DWORD)(c - '0');
+        } else if (c >= 'a' && c <= 'f') {
+            d = (DWORD)(c - 'a' + 10);
+        } else if (c >= 'A' && c <= 'F') {
+            d = (DWORD)(c - 'A' + 10);
+        } else {
+            return 0;
+        }
+        v = (v << 4) | d;
+        if (v > 0xffu) {
+            return 0;
+        }
+    }
+    *out = (unsigned char)v;
+    return 1;
 }
 
 static void safe_dump_ptr(DWORD addr, char *out, size_t outsz)
@@ -897,6 +938,103 @@ static int sync_vfile_position(VFILE *vf)
     return 0;
 }
 
+static int buffer_all_zero(const unsigned char *p, DWORD len)
+{
+    DWORD i;
+    for (i = 0; i < len; i++) {
+        if (p[i] != 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int path_looks_like_font(const WCHAR *path)
+{
+    int i;
+    for (i = 0; path[i] != 0 && i < 512; i++) {
+        WCHAR c0 = path[i];
+        WCHAR c1 = path[i + 1];
+        WCHAR c2 = path[i + 2];
+        if ((c0 == L'F' || c0 == L'f') &&
+            (c1 == L'n' || c1 == L'N') &&
+            (c2 == L't' || c2 == L'T')) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int path_looks_like_wpd(const WCHAR *path)
+{
+    int i;
+    for (i = 0; path[i] != 0 && i < 512; i++) {
+        WCHAR c0 = path[i];
+        WCHAR c1 = path[i + 1];
+        WCHAR c2 = path[i + 2];
+        if ((c0 == L'W' || c0 == L'w') &&
+            (c1 == L'P' || c1 == L'p') &&
+            (c2 == L'D' || c2 == L'd')) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int try_op34_direct(VFILE *vf, DWORD opcode_handle, const char *handle_kind,
+                           DWORD a2, DWORD a5, DWORD sectors,
+                           unsigned char *dst, DWORD dst_cap)
+{
+    unsigned char tail[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    DWORD data_len = 0;
+    DWORD ack_len = 0;
+    DWORD opcode;
+    DWORD nonzero = 0;
+    DWORD i;
+    char line[256];
+
+    if (!g_experimental_op34 || vf == NULL || dst == NULL || sectors == 0u) {
+        return -1;
+    }
+    if (dst_cap < sectors * 512u) {
+        return -1;
+    }
+
+    tail[0] = (unsigned char)((a2 >> 8) & 0xffu);
+    tail[1] = (unsigned char)(a2 & 0xffu);
+    tail[2] = (unsigned char)(a5 & 0xffu);
+    tail[3] = g_op34_session;
+    put_le32(tail + 4, (DWORD)(UINT_PTR)dst);
+    opcode = (opcode_handle << 16) | 0x0034u;
+
+    if (ab_cmd(sectors, opcode, tail, NULL, 0,
+               dst, dst_cap, &data_len, &ack_len, 1) != 0) {
+        append_text_log("OP34 experimental read failed\r\n");
+        return -1;
+    }
+    if (ack_len > data_len) {
+        ack_len = data_len;
+    }
+    for (i = 0; i < ack_len; i++) {
+        if (dst[i] != 0) {
+            nonzero++;
+        }
+    }
+    _snprintf_s(line, sizeof(line), _TRUNCATE,
+                "OP34 fallback %s=%lu local=%d remote=%lu "
+                "a0=0x%02x a2=0x%lx a5=0x%lx session=0x%02x "
+                "ack=%lu data=%lu nonzero=%lu\r\n",
+                handle_kind ? handle_kind : "handle",
+                (unsigned long)opcode_handle, vf->handle,
+                (unsigned long)vf->remote_handle,
+                (unsigned)((a2 >> 8) & 0xffu), (unsigned long)a2,
+                (unsigned long)a5, (unsigned)g_op34_session,
+                (unsigned long)ack_len, (unsigned long)data_len,
+                (unsigned long)nonzero);
+    append_text_log(line);
+    return (nonzero != 0u) ? (int)ack_len : -1;
+}
+
 /* Dedicated index9 (op34) read: fetch exactly nbytes (a4*512, = 4096) at the
  * given absolute file offset, in ONE AB read. This avoids two inefficiencies of
  * routing index9 through impl_read/ab_read_chunk:
@@ -959,6 +1097,27 @@ static int impl_sector_read(DWORD handle, DWORD offset, DWORD nbytes,
     }
     vf->stream_pos += ack_len;
     vf->desired_pos = vf->stream_pos;
+    if (g_experimental_op34 && nbytes == BLOCK_CACHE_BYTES) {
+        DWORD block = offset >> 12;
+        DWORD a2_full = block >> 8;
+        int needs_op34 =
+            (path_looks_like_font(vf->path) &&
+             (ack_len == 0u || (ack_len == nbytes && buffer_all_zero(dst, nbytes)))) ||
+            (path_looks_like_wpd(vf->path) && a2_full >= 0x100u);
+        if (needs_op34) {
+            int op34_len = try_op34_direct(vf, (DWORD)vf->handle, "local",
+                                           a2_full, block & 0xffu,
+                                           nbytes / 512u, dst, nbytes);
+            if (op34_len <= 0) {
+                op34_len = try_op34_direct(vf, vf->remote_handle, "remote",
+                                           a2_full, block & 0xffu,
+                                           nbytes / 512u, dst, nbytes);
+            }
+            if (op34_len > 0) {
+                ack_len = (DWORD)op34_len;
+            }
+        }
+    }
     /* Cache only full reads (short reads at EOF are not re-serveable safely). */
     if (ack_len == nbytes) {
         cache_store(key, offset, dst, ack_len);
@@ -1560,6 +1719,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
     if (reason == DLL_PROCESS_ATTACH) {
         char verbose_env[8] = "";
         char cache_env[8] = "";
+        char op34_disable_env[8] = "";
         InitializeCriticalSection(&g_lock);
         g_lock_ready = 1;
         g_link.dev = INVALID_HANDLE_VALUE;
@@ -1568,6 +1728,9 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
         /* Cache is on by default (path-keyed = correct); USBPC_NOCACHE=1 disables. */
         GetEnvironmentVariableA("USBPC_NOCACHE", cache_env, (DWORD)sizeof(cache_env));
         g_cache_enabled = (cache_env[0] != '1');
+        GetEnvironmentVariableA("USBPC_DISABLE_OP34", op34_disable_env, (DWORD)sizeof(op34_disable_env));
+        g_experimental_op34 = (op34_disable_env[0] != '1');
+        (void)parse_hex_byte_env("USBPC_OP34_SESSION", &g_op34_session);
     } else if (reason == DLL_PROCESS_DETACH) {
         if (g_lock_ready) {
             close_winusb_device();
